@@ -24,11 +24,14 @@ class Strategy:
         self.active_robots = []
         self.goalkeeper_id = None
         self.attackers = []
-        self.goalkeeper_arc_radius = 350.0  # Дуга вратаря перед воротами
-        self.goalkeeper_intercept_offset = 200.0  # Смещение на перехват
-        # Фильтр для плавности вратаря
+        self.goalkeeper_arc_radius = 350.0
+        self.goalkeeper_intercept_offset = 200.0
+        # Гистерезис для вратаря
+        self.gk_is_intercepting = False
+        self.gk_intercept_target = aux.Point(0, 0)
+        # Сглаживание
         self.gk_target_smooth = aux.Point(0, 0)
-        self.gk_smooth_alpha = 1.0  # Коэффициент сглаживания (0..1)
+        self.gk_smooth_alpha = 0.3
 
     def get_robots_id(self, field: fld.Field) -> list[int]:
         """Get list of active robot IDs"""
@@ -72,11 +75,8 @@ class Strategy:
     def get_goalkeeper_target(self, field: fld.Field) -> aux.Point:
         """
         Calculate goalkeeper target position.
-        Логика:
-        1. Вратарь всегда стоит на дуге перед воротами (не на линии!)
-        2. Если мяч летит в створ - выезжает на перехват по траектории
-        3. Если мяч за воротами/полем - стоит в центре
-        4. Плавное сглаживание позиции, чтобы не дёргался
+        С гистерезисом: если выехал на перехват - остаётся в нём,
+        пока мяч не остановится или не уедет за поле.
         """
         curr_ball = field.ball.get_pos()
         our_goal = field.ally_goal
@@ -85,18 +85,24 @@ class Strategy:
         min_y = min(our_goal.up.y, our_goal.down.y)
         goal_x = our_goal.center.x
 
-
         direction_sign = 1 if our_goal.eye_forw.x > 0 else -1
 
         ball_behind_goal_line = (
             (direction_sign > 0 and curr_ball.x < goal_x) or
             (direction_sign < 0 and curr_ball.x > goal_x)
         )
-
         ball_out_of_field = (
             abs(curr_ball.x) > const.FIELD_DX / 2 or
             abs(curr_ball.y) > const.FIELD_DY / 2
         )
+
+        ball_vel = field.ball.get_vel()
+        ball_speed = ball_vel.mag()
+
+        ball_stopped = ball_speed < 30
+
+        if ball_behind_goal_line or ball_out_of_field or ball_stopped:
+            self.gk_is_intercepting = False
 
         gk_line_x = goal_x + direction_sign * self.goalkeeper_arc_radius
 
@@ -105,34 +111,39 @@ class Strategy:
             field.strategy_image.draw_circle(target, (100, 100, 100), 50)
             return self._smooth_gk_target(target)
 
+        if not self.gk_is_intercepting:
+            ball_approaching = (
+                (direction_sign > 0 and ball_vel.x < -150) or
+                (direction_sign < 0 and ball_vel.x > 150)
+            )
 
-        ball_vel = field.ball.get_vel()
-        ball_speed = ball_vel.mag()
+            if ball_approaching and ball_speed > 200:
+                if abs(ball_vel.x) > 1e-2:
+                    t = (goal_x - curr_ball.x) / ball_vel.x
+                    if t > 0:
+                        predicted_y = curr_ball.y + ball_vel.y * t
+                        goal_margin = 400
+                        if (min_y - goal_margin) <= predicted_y <= (max_y + goal_margin):
+                            self.gk_is_intercepting = True
+                            intercept_x = goal_x + direction_sign * self.goalkeeper_intercept_offset
+                            final_y = max(min_y, min(max_y, predicted_y))
+                            self.gk_intercept_target = aux.Point(intercept_x, final_y)
 
-        ball_approaching_our_goal = (
-            (direction_sign > 0 and ball_vel.x < -50) or  
-            (direction_sign < 0 and ball_vel.x > 50) 
-        )
-
-        if ball_approaching_our_goal and ball_speed > 100:
-            if abs(ball_vel.x) > 1e-2:
+        if self.gk_is_intercepting:
+            if abs(ball_vel.x) > 1e-2 and ball_speed > 50:
                 t = (goal_x - curr_ball.x) / ball_vel.x
-                if t > 0:  
+                if t > 0:
                     predicted_y = curr_ball.y + ball_vel.y * t
+                    intercept_x = goal_x + direction_sign * self.goalkeeper_intercept_offset
+                    final_y = max(min_y, min(max_y, predicted_y))
+                    target = aux.Point(intercept_x, final_y)
+                    self.gk_intercept_target = target
 
-                    goal_margin = 150
-                    if (min_y - goal_margin) <= predicted_y <= (max_y + goal_margin):
-                        intercept_x = goal_x + direction_sign * self.goalkeeper_intercept_offset
-                        final_y = max(min_y, min(max_y, predicted_y))
-                        target = aux.Point(intercept_x, final_y)
-
-                        field.strategy_image.draw_line(
-                            curr_ball,
-                            aux.Point(goal_x, predicted_y),
-                            (255, 0, 0)
-                        )
-                        field.strategy_image.draw_circle(target, (255, 0, 0), 60)
-                        return self._smooth_gk_target(target)
+                    field.strategy_image.draw_line(
+                        curr_ball, aux.Point(goal_x, predicted_y), (255, 0, 0)
+                    )
+                    field.strategy_image.draw_circle(target, (255, 0, 0), 60)
+                    return self._smooth_gk_target(target)
 
         vec_to_up = our_goal.up - curr_ball
         vec_to_down = our_goal.down - curr_ball
@@ -163,7 +174,7 @@ class Strategy:
         return self._smooth_gk_target(target)
 
     def _smooth_gk_target(self, target: aux.Point) -> aux.Point:
-        """Плавное сглаживание позиции вратаря, чтобы не дёргался"""
+        """Плавное сглаживание позиции вратаря"""
         if self.gk_target_smooth.x == 0 and self.gk_target_smooth.y == 0:
             self.gk_target_smooth = target
             return target
@@ -175,9 +186,13 @@ class Strategy:
 
     def get_best_shot_target(self, field: fld.Field) -> aux.Point:
         """
-        Find the best target to shoot at enemy goal, avoiding their goalkeeper.
-        Строим касательные от мяча к вратарю противника, находим их пересечение
-        с линией ворот, выбираем точку подальше от вратаря.
+        Find the best target to shoot at enemy goal.
+        
+        Логика:
+        1. Строим касательные от мяча к вратарю противника
+        2. Находим их пересечение с линией ворот - это границы "тени" вратаря
+        3. "Тень" делит ворота на зоны: слева от тени, сама тень, справа от тени
+        4. Выбираем самую широкую свободную зону и бьём в её центр
         """
         curr_ball = field.ball.get_pos()
         enemy_goal = field.enemy_goal
@@ -190,74 +205,101 @@ class Strategy:
         goal_x = enemy_goal.center.x
 
         if enemy_gk_id is None or not field.enemies[enemy_gk_id].is_used():
-            if curr_ball.x < goal_x:
-                return goal_up if curr_ball.y < 0 else goal_down
-            else:
-                return goal_up if curr_ball.y > 0 else goal_down
+            target = enemy_goal.center
+            field.strategy_image.draw_circle(target, (255, 255, 0), 80)
+            field.strategy_image.draw_line(curr_ball, target, (255, 255, 0))
+            return target
 
         enemy_gk_pos = field.enemies[enemy_gk_id].get_pos()
-        gk_radius = 120  
+        gk_radius = 120
 
         mid_point = (curr_ball + enemy_gk_pos) / 2
         tangents_to_gk = get_tangent_points(enemy_gk_pos, mid_point, gk_radius)
 
         if len(tangents_to_gk) != 2:
-
-            return enemy_goal.center
+            target = enemy_goal.center
+            field.strategy_image.draw_circle(target, (255, 255, 0), 80)
+            return target
 
         goal_line_start = enemy_goal.up
         goal_line_end = enemy_goal.down
 
-        valid_targets = []
+        shadow_points = []  
 
         for tangent_point in tangents_to_gk:
             ray_direction = (tangent_point - curr_ball).unity()
             ray_end = curr_ball + ray_direction * 10000
 
             intersection = get_line_intersection(
-                curr_ball,
-                ray_end,
-                goal_line_start,
-                goal_line_end,
-                "SS"  
+                curr_ball, ray_end,
+                goal_line_start, goal_line_end,
+                "SS"
             )
 
             if intersection is not None:
-
-                if goal_min_y <= intersection.y <= goal_max_y:
-                    dot = (intersection - curr_ball).x * (goal_x - curr_ball.x)
-                    if dot > 0:  
-                        valid_targets.append(intersection)
+                dot = (intersection - curr_ball).x * (goal_x - curr_ball.x)
+                if dot > 0:
+                    shadow_points.append(intersection.y)
 
             field.strategy_image.draw_line(curr_ball, tangent_point, (255, 100, 0))
 
         field.strategy_image.draw_circle(enemy_gk_pos, (255, 0, 255), gk_radius)
+        if len(shadow_points) == 2:
+            shadow_min = min(shadow_points)
+            shadow_max = max(shadow_points)
+            field.strategy_image.draw_line(
+                aux.Point(goal_x, shadow_min),
+                aux.Point(goal_x, shadow_max),
+                (255, 0, 255)
+            )
 
-        if not valid_targets:
-            if enemy_gk_pos.y > enemy_goal.center.y:
-                target = enemy_goal.down
-            else:
-                target = enemy_goal.up
+        if len(shadow_points) != 2:
+            target = enemy_goal.center
             field.strategy_image.draw_circle(target, (255, 255, 0), 80)
             field.strategy_image.draw_line(curr_ball, target, (255, 255, 0))
             return target
 
-        best_target = max(valid_targets, key=lambda p: (p - enemy_gk_pos).mag())
+        shadow_min = min(shadow_points)
+        shadow_max = max(shadow_points)
 
-        field.strategy_image.draw_circle(best_target, (255, 255, 0), 80)
-        field.strategy_image.draw_line(curr_ball, best_target, (255, 255, 0))
+        zone1_width = max(0, shadow_min - goal_min_y)
+        zone1_center = (goal_min_y + shadow_min) / 2
 
-        for t in valid_targets:
-            field.strategy_image.draw_circle(t, (0, 200, 200), 40)
+        zone2_width = max(0, goal_max_y - shadow_max)
+        zone2_center = (shadow_max + goal_max_y) / 2
 
-        return best_target
+        if zone1_width > 10:
+            field.strategy_image.draw_line(
+                aux.Point(goal_x - 50, goal_min_y),
+                aux.Point(goal_x - 50, shadow_min),
+                (0, 255, 0)
+            )
+        if zone2_width > 10:
+            field.strategy_image.draw_line(
+                aux.Point(goal_x - 50, shadow_max),
+                aux.Point(goal_x - 50, goal_max_y),
+                (0, 255, 0)
+            )
+
+        if zone1_width < 10 and zone2_width < 10:
+            if enemy_gk_pos.y > enemy_goal.center.y:
+                target_y = goal_min_y + 50
+            else:
+                target_y = goal_max_y - 50
+        elif zone1_width > zone2_width:
+            target_y = zone1_center
+        else:
+            target_y = zone2_center
+
+        target = aux.Point(goal_x, target_y)
+
+        field.strategy_image.draw_circle(target, (255, 255, 0), 80)
+        field.strategy_image.draw_line(curr_ball, target, (255, 255, 0))
+
+        return target
 
     def get_approach_point(self, ball_pos: aux.Point, target_pos: aux.Point, distance: float = 180) -> aux.Point:
-        """
-        Calculate approach point behind the ball relative to target.
-        Робот должен подъехать к мячу СЗАДИ (со стороны, противоположной цели),
-        чтобы ударить мяч в цель.
-        """
+        """Calculate approach point behind the ball relative to target"""
         direction = (target_pos - ball_pos).unity()
         approach_point = ball_pos - direction * distance
         return approach_point
@@ -309,12 +351,13 @@ class Strategy:
 
         self.draw_all_robots(field)
 
+        # === ВРАТАРЬ ===
         if self.goalkeeper_id is not None:
             gk_target = self.get_goalkeeper_target(field)
-
             angle_to_ball = (curr_ball - gk_target).arg()
             actions[self.goalkeeper_id] = Actions.GoToPointIgnore(gk_target, angle_to_ball)
 
+        # === АТАКУЮЩИЙ ===
         if self.attackers:
             attacker_id = self.attackers[0]
             shot_target = self.get_best_shot_target(field)
@@ -324,27 +367,23 @@ class Strategy:
             dist_to_ball = (attacker_pos - curr_ball).mag()
 
             kick_angle = (shot_target - curr_ball).arg()
-
             approach_point = self.get_approach_point(curr_ball, shot_target, distance=180)
 
+            # Отладка
             field.strategy_image.draw_circle(approach_point, (0, 255, 0), 40)
             field.strategy_image.draw_line(approach_point, curr_ball, (0, 255, 0))
-            field.strategy_image.draw_circle(shot_target, (255, 255, 0), 60)
 
             robot_to_ball = curr_ball - attacker_pos
-
             ball_to_target = shot_target - curr_ball
-
 
             if robot_to_ball.mag() > 1e-5 and ball_to_target.mag() > 1e-5:
                 r2b_dir = robot_to_ball.unity()
                 b2t_dir = ball_to_target.unity()
                 dot_product = r2b_dir.x * b2t_dir.x + r2b_dir.y * b2t_dir.y
-
                 angle_diff = abs(aux.wind_down_angle(attacker_angle - kick_angle))
 
                 is_good_position = (
-                    dist_to_ball < 200 and
+                    dist_to_ball < 500 and
                     dot_product < -0.5 and
                     angle_diff < 0.4
                 )
@@ -353,13 +392,15 @@ class Strategy:
                     actions[attacker_id] = KickActions.Straight(shot_target)
                     field.strategy_image.draw_line(curr_ball, shot_target, (255, 0, 255))
                 else:
-                    # actions[attacker_id] = Actions.GoToPoint(approach_point, kick_angle)
                     actions[attacker_id] = KickActions.Straight(shot_target)
+
+                    # actions[attacker_id] = Actions.GoToPoint(approach_point, kick_angle)
             else:
-                if dist_to_ball < 150:
+                if dist_to_ball < 500:
                     actions[attacker_id] = KickActions.Straight(shot_target)
                 else:
                     actions[attacker_id] = KickActions.Straight(shot_target)
+
                     # actions[attacker_id] = Actions.GoToPoint(approach_point, kick_angle)
 
         self.prev_ball = curr_ball
