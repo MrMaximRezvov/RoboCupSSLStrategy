@@ -192,29 +192,6 @@ class Actions:
                 align_pos,
                 self.target_angle,
             )
-            if domain.field.is_ball_moves():
-                ADDING_VEL_ANGLE_MULT = 2.5
-                ADDING_VEL_COEF_MAX = 1.2
-
-                ADDING_DIST_ZERO = 2000
-                ADDING_DIST_MAX = 1200
-
-                diff_angle_speed = abs(
-                    aux.wind_down_angle(
-                        (ball_pos - domain.field.ball_start_point).arg() - aux.angle_to_point(ball_pos, robot_pos)
-                    )
-                )
-                diff_angle_view = abs(aux.wind_down_angle(self.target_angle - aux.angle_to_point(ball_pos, robot_pos)))
-
-                coef_angle_speed = diff_angle_speed * ADDING_VEL_ANGLE_MULT
-                coef_angle_view = 1.1 + diff_angle_view * ADDING_VEL_ANGLE_MULT
-                coef = min(coef_angle_speed, coef_angle_view, ADDING_VEL_COEF_MAX)
-
-                diff_dist = aux.dist(ball_pos, robot_pos)
-                coef *= aux.minmax((diff_dist - ADDING_DIST_ZERO) / (ADDING_DIST_MAX - ADDING_DIST_ZERO), 0, 1)
-
-                transl_vel += domain.field.ball.get_vel() * coef
-
             current_action.vel = transl_vel
             current_action.angle = self.target_angle
 

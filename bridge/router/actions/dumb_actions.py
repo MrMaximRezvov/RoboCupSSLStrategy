@@ -33,7 +33,7 @@ class DumbActions:
                 if self.angle_bounds is not None
                 else domain.robot.is_kick_aligned_by_angle(kick_angle)
             )
-            return domain.field.is_ball_in(domain.robot) and is_aligned
+            return is_aligned
 
         def behavior(self, domain: ActionDomain, current_action: ActionValues) -> None:
             current_action.auto_kick = self.autokick
