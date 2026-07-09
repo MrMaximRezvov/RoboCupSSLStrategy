@@ -495,17 +495,24 @@ class Strategy:
         if self.goalkeeper_id is not None:
             gk_target = self.get_goalkeeper_on_goal_line(field)
             positions[self.goalkeeper_id] = (gk_target, (ball - gk_target).arg())
+            # gk_result = self.get_goalkeeper_action(field)
+            # if isinstance(gk_result, aux.Point):
+                # angle_to_ball = (ball - gk_result).arg()
+                # positions[self.goalkeeper_id] = (gk_result, angle_to_ball)
+                # actions[self.goalkeeper_id] = Actions.GoToPoint(gk_result, angle_to_ball)
+            # else:
+                # actions[self.goalkeeper_id] = gk_result
 
         # Защитник — блокирует линию мяч-ворота слева
         if self.defender_id is not None:
-            block = self._get_defense_block_position(field, offset_side=-200.0)
+            block = self._get_defense_block_position(field, offset_side=-150.0)
             block = self._avoid_ally_penalty(field, block)
             block = self._enforce_min_ball_distance(field, block, min_ball_dist)
             positions[self.defender_id] = (block, (ball - block).arg())
 
         # Нападающий — блокирует справа (или отъезжает, если далеко)
         if self.attacker_id is not None:
-            block = self._get_defense_block_position(field, offset_side=200.0)
+            block = self._get_defense_block_position(field, offset_side=150.0)
             block = self._avoid_ally_penalty(field, block)
             block = self._enforce_min_ball_distance(field, block, min_ball_dist)
             positions[self.attacker_id] = (block, (ball - block).arg())
@@ -753,7 +760,7 @@ class Strategy:
                 self.handle_free_kick(field, actions, we_kick=self.we_active)
             # case GameStates.BALL_PLACEMENT:
             #     self.handle_ball_placement(field, actions)
-            case GameStates.TIMEOUT | GameStates.DEBUG:
+            case GameStates.TIMEOUT | GameStates.DEBUG | GameStates.BALL_PLACEMENT:
                 pass
 
         return actions

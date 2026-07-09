@@ -59,6 +59,7 @@ class Robot(entity.Entity):
         gains_catch = [2.8, 0.01, 0.87]  # for ricochet and pass receiving
         if color == const.COLOR and self.r_id == const.GK:
             gains_catch = [2.8, 0.01, 0.5]
+            gains_full = [4, 0.01, 0.3]  # kp, kd, dont; 2, 0.01
         a_gains_full = [15, 0.5]
         if const.IS_SIMULATOR_USED:
             gains_full = [1.8, 0.06, 0.0]
