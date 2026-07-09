@@ -477,47 +477,145 @@ class Strategy:
 
         return Actions.GoToPoint(ball, kick_angle)
 
-    # ОБОРОНА (универсальная для STOP / FREE_KICK не наш / KICKOFF не наш)
+
     def _get_defense_positions(self, field: fld.Field, min_ball_dist: float
                                 ) -> dict[int, tuple[aux.Point, float]]:
         """
         Оборонительные позиции:
-          - Вратарь — в воротах (на линии, следит за мячом).
-          - Защитник — блокирует линию мяч-наши ворота (сбоку).
-          - Нападающий — тоже блокирует (с другой стороны) или отъезжает.
+          - Вратарь — на дуге перед воротами (не на линии!),
+                      чтобы был выдвинут вперёд и мог свободно маневрировать.
+          - Защитник и нападающий — плотно на линии мяч-ворота,
+                      достаточно далеко от ворот, чтобы не мешать вратарю.
         min_ball_dist — минимальная дистанция до мяча (500 для STOP/KICKOFF, 0 для FREE_KICK).
         """
         ball = field.ball.get_pos()
         our_goal = field.ally_goal.center
         positions: dict[int, tuple[aux.Point, float]] = {}
 
-        # Вратарь — на линии ворот
-        if self.goalkeeper_id is not None:
-            gk_target = self.get_goalkeeper_on_goal_line(field)
-            positions[self.goalkeeper_id] = (gk_target, (ball - gk_target).arg())
-            # gk_result = self.get_goalkeeper_action(field)
-            # if isinstance(gk_result, aux.Point):
-                # angle_to_ball = (ball - gk_result).arg()
-                # positions[self.goalkeeper_id] = (gk_result, angle_to_ball)
-                # actions[self.goalkeeper_id] = Actions.GoToPoint(gk_result, angle_to_ball)
-            # else:
-                # actions[self.goalkeeper_id] = gk_result
+        # Минимальное расстояние от ворот, на котором могут стоять блокеры,
+        # чтобы вратарь на дуге (450мм) мог свободно двигаться между ними и воротами.
+        min_blocker_dist_from_goal = GK_ARC_RADIUS + 200.0  # 650мм от ворот
 
-        # Защитник — блокирует линию мяч-ворота слева
+        # --- Вратарь ---
+        # Используем обычную логику вратаря (дуга + предсказание),
+        # а не стояние на линии ворот. Это даёт вратарю пространство для манёвра.
+        if self.goalkeeper_id is not None:
+            gk_result = self.get_goalkeeper_action(field)
+            if isinstance(gk_result, aux.Point):
+                gk_target = gk_result
+                # Обеспечиваем минимальную дистанцию до мяча (для STOP)
+                gk_target = self._enforce_min_ball_distance(field, gk_target, min_ball_dist)
+                angle = (ball - gk_target).arg()
+                positions[self.goalkeeper_id] = (gk_target, angle)
+            else:
+                # Action (вынос/BallGrab) — в обороне не нужно, стоим на дуге
+                gk_target = self.get_goalkeeper_on_goal_line(field)
+                # Но выдвигаем вперёд на дугу
+                goal = field.ally_goal
+                gk_target = aux.Point(
+                    goal.center.x + goal.eye_forw.x * GK_ARC_RADIUS * 0.5,
+                    gk_target.y
+                )
+                gk_target = self._enforce_min_ball_distance(field, gk_target, min_ball_dist)
+                angle = (ball - gk_target).arg()
+                positions[self.goalkeeper_id] = (gk_target, angle)
+
+        # --- Блокеры (защитник + нападающий) ---
+        # Направление от мяча к нашим воротам
+        to_goal = our_goal - ball
+        if to_goal.mag() < 1e-3:
+            to_goal = aux.Point(field.polarity * -1.0, 0.0)
+        dir_to_goal = to_goal.unity()
+        perp = aux.Point(-dir_to_goal.y, dir_to_goal.x)
+
+        # Расстояние от мяча до линии блокеров:
+        # берём максимум из DEF_BLOCK_DISTANCE и min_blocker_dist_from_goal
+        dist_ball_to_goal = to_goal.mag()
+        blocker_dist_from_ball = max(
+            DEF_BLOCK_DISTANCE,
+            dist_ball_to_goal - min_blocker_dist_from_goal
+        )
+        # Не ставим блокеры дальше мяча (за мячом)
+        blocker_dist_from_ball = max(100.0, min(blocker_dist_from_ball, dist_ball_to_goal - 100.0))
+
+        # Базовая точка на линии мяч-ворота
+        base_block = ball + dir_to_goal * blocker_dist_from_ball
+
+        # Расстояние между блокерами: чуть больше диаметра робота,
+        # чтобы не было дыр, но и не перекрывались.
+        # Диаметр робота ~180мм, ставим зазор ~100мм между краями => ~140мм от центра
+        blocker_half_gap = 90.0
+
+        # Определяем, какой робот слева, какой справа (по Y мяча)
+        # Это нужно, чтобы блокеры не менялись местами каждый кадр
+        defender_side = -1.0  # защитник слева
+        attacker_side = 1.0   # нападающий справа
+
         if self.defender_id is not None:
-            block = self._get_defense_block_position(field, offset_side=-150.0)
+            block = base_block + perp * (blocker_half_gap * defender_side)
             block = self._avoid_ally_penalty(field, block)
             block = self._enforce_min_ball_distance(field, block, min_ball_dist)
             positions[self.defender_id] = (block, (ball - block).arg())
+            field.strategy_image.draw_circle(block, (0, 150, 255), 40)
 
-        # Нападающий — блокирует справа (или отъезжает, если далеко)
         if self.attacker_id is not None:
-            block = self._get_defense_block_position(field, offset_side=150.0)
+            block = base_block + perp * (blocker_half_gap * attacker_side)
             block = self._avoid_ally_penalty(field, block)
             block = self._enforce_min_ball_distance(field, block, min_ball_dist)
             positions[self.attacker_id] = (block, (ball - block).arg())
+            field.strategy_image.draw_circle(block, (0, 255, 150), 40)
+
+        # Отладка: рисуем линию блокеров и позицию вратаря
+        if self.defender_id is not None and self.attacker_id is not None:
+            def_pos = positions[self.defender_id][0]
+            att_pos = positions[self.attacker_id][0]
+            field.strategy_image.draw_line(def_pos, att_pos, (0, 200, 255))
+        if self.goalkeeper_id is not None:
+            gk_pos = positions[self.goalkeeper_id][0]
+            field.strategy_image.draw_circle(gk_pos, (255, 0, 255), 50)
 
         return positions
+    # # ОБОРОНА (универсальная для STOP / FREE_KICK не наш / KICKOFF не наш)
+    # def _get_defense_positions(self, field: fld.Field, min_ball_dist: float
+    #                             ) -> dict[int, tuple[aux.Point, float]]:
+    #     """
+    #     Оборонительные позиции:
+    #       - Вратарь — в воротах (на линии, следит за мячом).
+    #       - Защитник — блокирует линию мяч-наши ворота (сбоку).
+    #       - Нападающий — тоже блокирует (с другой стороны) или отъезжает.
+    #     min_ball_dist — минимальная дистанция до мяча (500 для STOP/KICKOFF, 0 для FREE_KICK).
+    #     """
+    #     ball = field.ball.get_pos()
+    #     our_goal = field.ally_goal.center
+    #     positions: dict[int, tuple[aux.Point, float]] = {}
+
+    #     # Вратарь — на линии ворот
+    #     if self.goalkeeper_id is not None:
+    #         gk_target = self.get_goalkeeper_on_goal_line(field)
+    #         positions[self.goalkeeper_id] = (gk_target, (ball - gk_target).arg())
+    #         # gk_result = self.get_goalkeeper_action(field)
+    #         # if isinstance(gk_result, aux.Point):
+    #             # angle_to_ball = (ball - gk_result).arg()
+    #             # positions[self.goalkeeper_id] = (gk_result, angle_to_ball)
+    #             # actions[self.goalkeeper_id] = Actions.GoToPoint(gk_result, angle_to_ball)
+    #         # else:
+    #             # actions[self.goalkeeper_id] = gk_result
+
+    #     # Защитник — блокирует линию мяч-ворота слева
+    #     if self.defender_id is not None:
+    #         block = self._get_defense_block_position(field, offset_side=-150.0)
+    #         block = self._avoid_ally_penalty(field, block)
+    #         block = self._enforce_min_ball_distance(field, block, min_ball_dist)
+    #         positions[self.defender_id] = (block, (ball - block).arg())
+
+    #     # Нападающий — блокирует справа (или отъезжает, если далеко)
+    #     if self.attacker_id is not None:
+    #         block = self._get_defense_block_position(field, offset_side=150.0)
+    #         block = self._avoid_ally_penalty(field, block)
+    #         block = self._enforce_min_ball_distance(field, block, min_ball_dist)
+    #         positions[self.attacker_id] = (block, (ball - block).arg())
+
+    #     return positions
 
     # СТАНДАРТНЫЕ ПОЛОЖЕНИЯ
     def handle_stop(self, field: fld.Field, actions: list[Optional[Action]]) -> None:
