@@ -1,4 +1,4 @@
-"""High-level strategy code — SSL 3v3, prepare/penalty fixed"""
+"""High-level strategy code — SSL 3v3, penalty kicker + goalkeeper clearance"""
 
 import math
 from typing import Optional, Union
@@ -19,7 +19,7 @@ from bridge.router.actions import (
 GK_ARC_RADIUS = 450.0
 GK_FORWARD_OFFSET = 150.0
 DEF_BLOCK_DISTANCE = 700.0
-APPROACH_OFFSET = 180.0
+APPROACH_OFFSET = 500.0
 GK_SHADOW_RADIUS = 120.0
 MAX_KICK_VOLTAGE = 15.0
 PASS_VOLTAGE = 5.0
@@ -30,7 +30,8 @@ KICK_RANGE = 500.0
 APPROACH_RANGE = 100.0
 GK_CLEARANCE_RANGE = 300.0
 STOP_DISTANCE = 500.0
-PENALTY_POSITION_DIST = 1500.0  # Расстояние от центра для penalty позиций
+PENALTY_STAND_DIST = 1500.0       # Позиция стоящих роботов (своя половина)
+GK_ON_LINE_OFFSET = -30.0          # Сдвиг вратаря от линии ворот в сторону поля
 
 
 class Strategy:
@@ -153,22 +154,41 @@ class Strategy:
 
         return retreat_point
 
-    def _get_penalty_position(self, field: fld.Field, robot_id: int,
-                               offset_idx: int = 0) -> aux.Point:
+    def _get_penalty_stand_position(self, field: fld.Field, offset_idx: int = 0, polarity = False) -> aux.Point:
         """
-        Позиция для PENALTY: на ЧУЖОЙ половине поля, далеко от мяча.
-        offset_idx — индекс для расстановки нескольких роботов в ряд.
+        Позиция для роботов, которые стоят в PENALTY:
+        на СВОЕЙ половине поля, далеко от мяча.
+        Работает с двух сторон через field.polarity.
         """
-        # Чужая половина поля (противоположно polarity)
-        enemy_side_x = field.polarity * -PENALTY_POSITION_DIST
-        
+        # Своя половина: x имеет тот же знак, что и polarity
+        if polarity:
+            our_side_x = field.polarity * PENALTY_STAND_DIST
+        else:
+            our_side_x = -field.polarity * PENALTY_STAND_DIST
+
         # Перпендикулярное смещение для расстановки в ряд
         perp_offset = (offset_idx - 0.5) * 600  # -300, +300 для двух роботов
-        
-        target = aux.Point(enemy_side_x, perp_offset)
-        return target
 
-    def _is_robot_on_position(self, field: fld.Field, robot_id: int, 
+        return aux.Point(our_side_x, perp_offset)
+
+    def _get_penalty_kicker_position(self, field: fld.Field) -> aux.Point:
+        """
+        Позиция для бьющего в PENALTY: за мячом, со стороны своих ворот.
+        Работает с двух сторон.
+        """
+        ball = field.ball.get_pos()
+        enemy_goal = field.enemy_goal.center
+
+        # Направление от мяча к чужим воротам
+        to_enemy = enemy_goal - ball
+        if to_enemy.mag() < 1e-3:
+            to_enemy = aux.Point(field.polarity * 1.0, 0.0)
+
+        # Позиция за мячом (с противоположной стороны от чужих ворот)
+        approach = ball - to_enemy.unity() * APPROACH_OFFSET
+        return approach
+
+    def _is_robot_on_position(self, field: fld.Field, robot_id: int,
                                target: aux.Point, threshold: float = 50.0) -> bool:
         """Проверяет, находится ли робот уже на целевой позиции."""
         robot_pos = field.allies[robot_id].get_pos()
@@ -243,22 +263,64 @@ class Strategy:
 
     def get_goalkeeper_on_goal_line(self, field: fld.Field) -> aux.Point:
         """
-        Вратарь стоит СТРОГО на линии ворот, двигаясь только по Y,
-        следуя за проекцией мяча.
+        Вратарь стоит на линии ворот (с небольшим сдвигом в сторону поля),
+        двигаясь только по Y, следуя за проекцией мяча.
+        Работает с двух сторон через goal.eye_forw.x.
         """
         ball = field.ball.get_pos()
         goal = field.ally_goal
 
-        goal_line_x = goal.center.x
+        # X: линия ворот + сдвиг в сторону поля (чтобы не стоять прямо на линии)
+        goal_line_x = goal.center.x + goal.eye_forw.x * GK_ON_LINE_OFFSET
         min_y = min(goal.up.y, goal.down.y)
         max_y = max(goal.up.y, goal.down.y)
 
+        # Y: проекция мяча на линию ворот
         target_y = max(min_y, min(max_y, ball.y))
 
         target = aux.Point(goal_line_x, target_y)
         field.strategy_image.draw_circle(target, (255, 0, 255), 60)
         field.strategy_image.draw_line(goal.up, goal.down, (255, 0, 255))
         return target
+
+    def get_goalkeeper_penalty_action(self, field: fld.Field) -> Action:
+        """
+        Поведение вратаря в PENALTY:
+          - Если мяч в нашей штрафной (поймал) → мощный вынос.
+          - Иначе → стоит на линии ворот, следит за мячом.
+        """
+        ball = field.ball.get_pos()
+        gk_pos = field.allies[self.goalkeeper_id].get_pos()
+        gk_angle = field.allies[self.goalkeeper_id].get_angle()
+        enemy_goal = field.enemy_goal.center
+
+        # Мяч в нашей штрафной — выносим мощно
+        if self.is_in_ally_penalty_area(field, ball):
+            pass_target = enemy_goal
+            kick_angle = (pass_target - ball).arg()
+            dist_to_ball = (gk_pos - ball).mag()
+            angle_diff = abs(aux.wind_down_angle(gk_angle - kick_angle))
+
+            field.strategy_image.draw_line(ball, pass_target, (255, 0, 255))
+
+            # Близко и смотрим туда → бьём
+            if dist_to_ball < GK_CLEARANCE_RANGE and angle_diff < 0.5:
+                return KickActions.Straight(pass_target, voltage=CLEARANCE_VOLTAGE)
+
+            # Мяч за спиной → разворот
+            if dist_to_ball < BALL_BEHIND_THRESHOLD:
+                angle_to_ball = (ball - gk_pos).arg()
+                angle_diff_to_ball = abs(aux.wind_down_angle(gk_angle - angle_to_ball))
+                if angle_diff_to_ball > math.pi / 2:
+                    return Actions.BallGrab(angle_to_ball)
+
+            # Едем к мячу
+            return Actions.GoToPoint(ball, kick_angle, ball_catch=True)
+
+        # Иначе — на линии ворот
+        gk_target = self.get_goalkeeper_on_goal_line(field)
+        angle = (ball - gk_target).arg()
+        return Actions.GoToPoint(gk_target, angle)
 
     # ЗАЩИТНИК
     def get_defender_target(self, field: fld.Field) -> aux.Point:
@@ -456,9 +518,9 @@ class Strategy:
                 to_goal = aux.Point(field.polarity * -1.0, 0.0)
             approach = ball + to_goal.unity() * APPROACH_OFFSET
             positions[self.attacker_id] = (approach, (enemy_goal - ball).arg())
-
+    
         if self.defender_id is not None:
-            side_point = ball + aux.Point(-300 * field.polarity, 400)
+            side_point = ball + aux.Point(400 * field.polarity, 400)
             positions[self.defender_id] = (side_point, (enemy_goal - side_point).arg())
 
         return positions
@@ -469,11 +531,7 @@ class Strategy:
         positions = self._kickoff_positions(field)
 
         for rid, (target, angle) in positions.items():
-            # Если робот уже на позиции — стоит на месте
-            if self._is_robot_on_position(field, rid, target):
-                actions[rid] = Actions.GoToPoint(target, angle)
-            else:
-                actions[rid] = Actions.GoToPoint(target, angle)
+            actions[rid] = Actions.GoToPoint(target, angle)
 
     def handle_kickoff(self, field: fld.Field, actions: list[Optional[Action]], we_kick: bool) -> None:
         """KICKOFF: если мы бьём — нападающий бьёт, иначе стоим."""
@@ -506,7 +564,12 @@ class Strategy:
         """
         Позиции для PENALTY/PREPARE_PENALTY.
         Вратарь — на линии ворот.
-        Остальные — на ЧУЖОЙ половине поля.
+        Если we_kick=True:
+          - Нападающий (бьющий) — у мяча (за мячом со стороны своих ворот).
+          - Защитник — на своей половине поля.
+        Если we_kick=False:
+          - Все не-вратарь — на своей половине поля.
+        Работает с двух сторон через field.polarity.
         """
         ball = field.ball.get_pos()
         enemy_goal = field.enemy_goal.center
@@ -518,73 +581,87 @@ class Strategy:
             look_dir = enemy_goal if we_kick else ball
             positions[self.goalkeeper_id] = (gk_target, (look_dir - gk_target).arg())
 
-        # Остальные — на чужой половине поля
-        if self.attacker_id is not None:
-            att_pos = self._get_penalty_position(field, self.attacker_id, offset_idx=0)
-            look = enemy_goal if we_kick else ball
-            positions[self.attacker_id] = (att_pos, (look - att_pos).arg())
+        if we_kick:
+            # Нападающий — у мяча (бьющий)
+            if self.attacker_id is not None:
+                att_pos = self._get_penalty_kicker_position(field)
+                positions[self.attacker_id] = (att_pos, (enemy_goal - att_pos).arg())
 
-        if self.defender_id is not None:
-            def_pos = self._get_penalty_position(field, self.defender_id, offset_idx=1)
-            look = ball
-            positions[self.defender_id] = (def_pos, (look - def_pos).arg())
+            # Защитник — на своей половине
+            if self.defender_id is not None:
+                def_pos = self._get_penalty_stand_position(field, offset_idx=0, polarity=True)
+                positions[self.defender_id] = (def_pos, (ball - def_pos).arg())
+        else:
+            # Все не-вратарь — на своей половине
+            if self.attacker_id is not None:
+                att_pos = self._get_penalty_stand_position(field, offset_idx=0)
+                positions[self.attacker_id] = (att_pos, (ball - att_pos).arg())
+
+            if self.defender_id is not None:
+                def_pos = self._get_penalty_stand_position(field, offset_idx=1)
+                positions[self.defender_id] = (def_pos, (ball - def_pos).arg())
 
         return positions
 
     def handle_prepare_penalty(self, field: fld.Field, actions: list[Optional[Action]]) -> None:
-        """PREPARE_PENALTY: занимаем позиции и НЕ двигаемся."""
+        """
+        PREPARE_PENALTY: занимаем позиции и НЕ двигаемся.
+        Если we_active=True — нападающий уже у мяча.
+        """
         self.assign_roles(field)
         positions = self._penalty_positions(field, we_kick=self.we_active)
 
         for rid, (target, angle) in positions.items():
-            # Если робот уже на позиции — стоит на месте
-            if self._is_robot_on_position(field, rid, target):
-                actions[rid] = Actions.GoToPoint(target, angle)
+            if(rid == self.goalkeeper_id):
+                actions[rid] = Actions.GoToPointIgnore(target, angle)
             else:
                 actions[rid] = Actions.GoToPoint(target, angle)
 
     def handle_penalty(self, field: fld.Field, actions: list[Optional[Action]], we_kick: bool) -> None:
         """
         PENALTY:
-          - Вратарь двигается (следит за мячом на линии ворот).
-          - Остальные НЕ двигаются (стоят на чужой половине).
-          - Если мы бьём — нападающий бьёт.
+          - Вратарь:
+              * Если мяч в нашей штрафной (поймал) → мощный вынос.
+              * Иначе → стоит на линии ворот, следит за мячом.
+          - Если we_kick=True:
+              * Нападающий бьёт (если близко к мячу).
+              * Защитник стоит на своей половине.
+          - Если we_kick=False:
+              * Все не-вратарь стоят на своей половине.
         """
         self.assign_roles(field)
         ball = field.ball.get_pos()
         enemy_goal = field.enemy_goal.center
 
-        # Вратарь — ВСЕГДА двигается (следит за мячом)
+        # Вратарь — ВСЕГДА использует специальную логику для PENALTY
         if self.goalkeeper_id is not None:
-            gk_target = self.get_goalkeeper_on_goal_line(field)
-            look_dir = enemy_goal if we_kick else ball
-            angle = (look_dir - gk_target).arg()
-            actions[self.goalkeeper_id] = Actions.GoToPoint(gk_target, angle)
+            actions[self.goalkeeper_id] = self.get_goalkeeper_penalty_action(field)
 
         if we_kick:
             # Нападающий бьёт
             if self.attacker_id is not None:
                 att_pos = field.allies[self.attacker_id].get_pos()
                 dist_to_ball = (att_pos - ball).mag()
-                
-                if dist_to_ball < KICK_RANGE:
-                    actions[self.attacker_id] = KickActions.Straight(enemy_goal, voltage=MAX_KICK_VOLTAGE)
-                else:
-                    # Стоит на позиции (не едет к мячу)
-                    pos = self._get_penalty_position(field, self.attacker_id, offset_idx=0)
-                    actions[self.attacker_id] = Actions.GoToPoint(pos, (enemy_goal - pos).arg())
 
-            # Защитник — стоит на позиции
+                if dist_to_ball < KICK_RANGE:
+                    actions[self.attacker_id] = KickActions.Straight(
+                        enemy_goal, voltage=MAX_KICK_VOLTAGE)
+                else:
+                    # Едет к позиции за мячом (на случай, если не успел в PREPARE)
+                    kicker_pos = self._get_penalty_kicker_position(field)
+                    actions[self.attacker_id] = Actions.GoToPoint(
+                        kicker_pos, (enemy_goal - kicker_pos).arg())
+
+            # Защитник — стоит на своей половине
             if self.defender_id is not None:
-                def_pos = self._get_penalty_position(field, self.defender_id, offset_idx=1)
+                def_pos = self._get_penalty_stand_position(field, offset_idx=0)
                 actions[self.defender_id] = Actions.GoToPoint(def_pos, (ball - def_pos).arg())
         else:
-            # Все не-вратарь стоят на чужой половине
-            for rid in (self.attacker_id, self.defender_id):
+            # Все не-вратарь стоят на своей половине
+            for rid, offset_idx in ((self.attacker_id, 0), (self.defender_id, 1)):
                 if rid is None:
                     continue
-                offset_idx = 0 if rid == self.attacker_id else 1
-                pos = self._get_penalty_position(field, rid, offset_idx=offset_idx)
+                pos = self._get_penalty_stand_position(field, offset_idx=offset_idx)
                 actions[rid] = Actions.GoToPoint(pos, (ball - pos).arg())
 
     def handle_free_kick(self, field: fld.Field, actions: list[Optional[Action]], we_kick: bool) -> None:
@@ -625,6 +702,13 @@ class Strategy:
     # Главный цикл
     def process(self, field: fld.Field) -> list[Optional[Action]]:
         """Game State Management"""
+
+        print(f"State: {field.game_state}")
+        print(f"GK: {self.goalkeeper_id}")
+        print(f"ATT: {self.attacker_id}")
+        print(f"DEF: {self.defender_id}")
+
+
         if field.game_state not in [GameStates.KICKOFF, GameStates.PENALTY]:
             self.we_active = field.active_team in [const.Color.ALL, field.ally_color]
 
@@ -647,8 +731,8 @@ class Strategy:
                 self.handle_penalty(field, actions, we_kick=self.we_active)
             case GameStates.FREE_KICK:
                 self.handle_free_kick(field, actions, we_kick=self.we_active)
-            case GameStates.BALL_PLACEMENT:
-                self.handle_ball_placement(field, actions)
+            # case GameStates.BALL_PLACEMENT:
+                # self.handle_ball_placement(field, actions)
             case GameStates.TIMEOUT | GameStates.DEBUG:
                 pass
 
